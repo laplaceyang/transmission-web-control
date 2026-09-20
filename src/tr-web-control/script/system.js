@@ -189,24 +189,27 @@ var system = {
 
 		$.each(items, function (key, item) {
 			var name = $(item).attr("system-lang");
-			if (name.substr(0, 1) == "[") {
-				$(item).html(eval("system.lang" + name));
-			} else {
-				$(item).html(eval("system.lang." + name));
-			}
+			$(item).html(system.getLangValue(name));
 		});
 
 		items = parent.find("*[system-tip-lang]");
 
 		$.each(items, function (key, item) {
 			var name = $(item).attr("system-tip-lang");
-			if (name.substr(0, 1) == "[") {
-				$(item).attr("title", eval("system.lang" + name));
-			} else {
-				$(item).attr("title", eval("system.lang." + name));
-			}
-
+			$(item).attr("title", system.getLangValue(name));
 		});
+	},
+	// 按 "a.b" / "['a']['b']" 形式的键路径取语言文案（替代原 eval 实现）
+	getLangValue: function (path) {
+		var cur = system.lang;
+		var keys = String(path || "").replace(/\[/g, ".").replace(/\]/g, "").replace(/['"]/g, "").split(".");
+		for (var i = 0; i < keys.length; i++) {
+			var k = keys[i];
+			if (!k) continue;
+			if (cur == null || typeof cur !== "object") return "";
+			cur = cur[k];
+		}
+		return cur == null ? "" : cur;
 	},
 	initdata: function () {
 		//this.panel.title.text(this.lang.system.title+" "+this.version+" ("+this.codeupdate+")");
@@ -637,14 +640,33 @@ var system = {
 				}
 			}
 		}
-		
+
+		// [torrent-db] 分类导航组插在"全部"之下、数据目录之上
+		if (window.TorrentDB) {
+			items.splice(1, 0, TorrentDB.navGroup());
+		}
+
 		this.panel.left.tree({
 			data: items,
+			// [torrent-db] 分类维度节点不参与树的光标选择：点击只切换分类筛选并
+			// 独立高亮，与状态节点互不干扰，可同时生效（复合筛选）
+			onBeforeSelect: function (node) {
+				if (window.TorrentDB && TorrentDB.isCategoryNode(node.id)) {
+					TorrentDB.onCategoryNodeClick(node);
+					return false;
+				}
+			},
 			onSelect: function (node) {
 				system.loadTorrentToList({
 					node: node
 				});
 				system.currentListDir = node.downDir;
+			},
+			// [torrent-db] 分类组右键菜单（添加分类/移除未使用的分类）
+			onContextMenu: function (e, node) {
+				if (window.TorrentDB && TorrentDB.onTreeContextMenu(node, e)) {
+					e.preventDefault();
+				}
 			},
 			lines: true
 		});
@@ -992,6 +1014,11 @@ var system = {
 					"data-clipboard-target": "#clipboard-source"
 				});
     			var clipboard = new ClipboardJS(btn.get(0));
+
+				// [torrent-db] 分类子菜单（追加在菜单末尾）
+				if (window.TorrentDB) {
+					TorrentDB.appendContextMenu(parent);
+				}
 
 				break;
 		}
@@ -2186,7 +2213,10 @@ var system = {
 
 					default:
 						// Categories
-						if (config.node.id.indexOf("folders-") != -1) {
+						// [torrent-db] 分类节点：取全部种子，交给后面的分类过滤钩子筛选
+						if (config.node.id.indexOf("torrentdb-cat-") == 0) {
+							torrents = transmission.torrents.all;
+						} else if (config.node.id.indexOf("folders-") != -1) {
 							var folder = transmission.torrents.folders[config.node.id];
 							if (folder) {
 								if (!this.config.hideSubfolders) {
@@ -2215,6 +2245,11 @@ var system = {
 						break;
 				}
 				break;
+		}
+
+		// [torrent-db] 按分类二次过滤（与上方导航条件复合）
+		if (window.TorrentDB) {
+			torrents = TorrentDB.filterTorrents(torrents);
 		}
 
 		if (this.config.defaultSelectNode != config.node.id) {
@@ -3465,6 +3500,11 @@ $(document).ready(function () {
 	// Loads a list of available languages
 	$.getJSON(system.rootPath + "i18n.json").done(function(result){
 		system.languages = result;
+		// [torrent-db] 允许 ?rpc= 覆盖 transmission RPC 地址（本地开发联调用）
+		var rpcOverride = location.search.getQueryString("rpc");
+		if (rpcOverride) {
+			transmission.rpcpath = rpcOverride;
+		}
 		system.init(location.search.getQueryString("lang"), location.search.getQueryString("local"));
 	});
 });

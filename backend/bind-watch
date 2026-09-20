@@ -1,0 +1,180 @@
+#!/usr/bin/with-contenv python3
+# -*- coding: utf-8 -*-
+"""bind-watch: 让 transmission 绑定在指定网卡的当前地址上（IPv4+IPv6）。
+
+- 绑定网卡名存在 torrent-db 的 SQLite settings 表（key=bind_interface）里，
+  由 web-control 前端"绑定"页签管理；compose 环境变量 BIND_INTERFACE 只作
+  首次种子值（表里没有该键时写入一次）。
+- bind_interface 为空字符串 = 不绑定任何网卡：清除状态文件，并把
+  settings.json 还原为 transmission 默认（0.0.0.0 / ::，监听全部地址）。
+- 地址变化时：s6-rc 停 daemon（退出时它会回写 settings.json）→ 改写 →
+  再启动，TCP/UDP 套接字才会重新绑定。
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import time
+
+BIND_INTERFACE_ENV = os.environ.get("BIND_INTERFACE", "")  # 首次种子值
+INTERVAL = int(os.environ.get("BIND_CHECK_INTERVAL", "60"))
+SETTINGS = "/config/settings.json"
+STATUS = "/config/public_html/bind-status.txt"
+DB_PATH = "/config/torrent-db.sqlite3"
+KEY = "bind_interface"
+SVC = "svc-transmission"
+
+
+def log(msg):
+    print("[bind-watch] %s %s" % (time.strftime("%F %T"), msg), flush=True)
+
+
+# ---------------------------------------------------------------- settings 表
+
+def read_setting():
+    """返回 bind_interface 值；库/表不可读时返回 None。"""
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % DB_PATH, uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (KEY,)).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else ""
+    except sqlite3.Error:
+        return None
+
+
+def seed_setting():
+    """首次运行：把 compose 环境变量写入 settings 表作种子值。"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (KEY, BIND_INTERFACE_ENV),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        log("seeded bind_interface=%r from env" % BIND_INTERFACE_ENV)
+    except sqlite3.Error as e:
+        log("seed failed (torrent-db may not be ready yet): %s" % e)
+
+
+# ---------------------------------------------------------------- settings.json
+
+def load_settings():
+    with open(SETTINGS, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def rewrite_settings(mutate):
+    """停 daemon → 改写 settings.json → 再启动（daemon 退出时会回写配置）。"""
+    cfg = load_settings()
+    mutate(cfg)
+    subprocess.run(["s6-rc", "-d", "change", SVC], check=False)
+    for _ in range(50):
+        if subprocess.run(["pidof", "transmission-daemon"], capture_output=True).returncode != 0:
+            break
+        time.sleep(0.2)
+    tmp = SETTINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS)
+    subprocess.run(["s6-rc", "-u", "change", SVC], check=False)
+
+
+def addrs(dev):
+    """返回网卡的 global IPv4/IPv6（无则空串）。"""
+    v4 = v6 = ""
+    out4 = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", dev, "scope", "global"],
+        capture_output=True, text=True,
+    ).stdout
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out4)
+    if m:
+        v4 = m.group(1)
+    out6 = subprocess.run(
+        ["ip", "-6", "addr", "show", "dev", dev, "scope", "global"],
+        capture_output=True, text=True,
+    ).stdout
+    m = re.search(r"inet6 ([0-9a-fA-F:]+)", out6)
+    if m:
+        v6 = m.group(1)
+    return v4, v6
+
+
+def write_status(dev, v4, v6):
+    os.makedirs(os.path.dirname(STATUS), exist_ok=True)
+    with open(STATUS, "w", encoding="utf-8") as f:
+        f.write(
+            "interface=%s\nipv4=%s\nipv6=%s\nupdated=%s\n"
+            % (dev, v4, v6, time.strftime("%F %T"))
+        )
+
+
+def main():
+    seed_setting()
+    log("started (interval=%ss, seed_env=%r)" % (INTERVAL, BIND_INTERFACE_ENV))
+    last = BIND_INTERFACE_ENV  # DB 不可读时沿用上次已知值
+    while True:
+        try:
+            value = read_setting()
+            if value is None:
+                dev = last  # 库/表暂不可用，保持现状
+            else:
+                dev = value
+                last = dev
+
+            if not dev:
+                # 不绑定任何网卡：还原默认并清掉状态文件
+                if os.path.exists(STATUS):
+                    os.remove(STATUS)
+                cfg = load_settings()
+                if cfg.get("bind-address-ipv4", "0.0.0.0") not in ("0.0.0.0", "") or \
+                        cfg.get("bind-address-ipv6", "::") not in ("::", ""):
+                    log("unbound: resetting bind addresses to defaults")
+
+                    def reset(c):
+                        c["bind-address-ipv4"] = "0.0.0.0"
+                        c["bind-address-ipv6"] = "::"
+
+                    rewrite_settings(reset)
+                time.sleep(INTERVAL)
+                continue
+
+            v4, v6 = addrs(dev)
+            write_status(dev, v4, v6)
+
+            if not v4:
+                log("%s has no global IPv4, waiting..." % dev)
+                time.sleep(INTERVAL)
+                continue
+
+            cfg = load_settings()
+            if cfg.get("bind-address-ipv4") != v4 or (v6 and cfg.get("bind-address-ipv6") != v6):
+                log("%s: %s/%s -> %s/%s" % (
+                    dev,
+                    cfg.get("bind-address-ipv4"), cfg.get("bind-address-ipv6"),
+                    v4, v6,
+                ))
+
+                def setbind(c):
+                    c["bind-address-ipv4"] = v4
+                    if v6:
+                        c["bind-address-ipv6"] = v6
+
+                rewrite_settings(setbind)
+        except Exception as e:  # 轮询永不退出
+            log("error: %s" % e)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

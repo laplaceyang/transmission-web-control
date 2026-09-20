@@ -31,11 +31,14 @@
 	<!-- System class library -->
 	<script type="text/javascript" src="tr-web-control/script/min/FileSaver.min.js?v=20200914"></script>
 	<script type="text/javascript" src="tr-web-control/script/other/clipboard.min.js"></script>
-	<script type="text/javascript" src="tr-web-control/script/min/public.min.js?v=20200914"></script>
+	<!-- [torrent-db] 以下加载源码版而非 script/min 压缩版，便于维护自己的改动 -->
+	<script type="text/javascript" src="tr-web-control/script/public.js?v=20260929"></script>
 	<script type="text/javascript" src="tr-web-control/script/other/ua-parser.min.js?v=20200914"></script>
-	<script type="text/javascript" src="tr-web-control/script/min/transmission.min.js?v=20200914"></script>
-	<script type="text/javascript" src="tr-web-control/script/min/transmission.torrents.min.js?v=20201001"></script>
-	<script type="text/javascript" src="tr-web-control/script/min/system.min.js?v=20201001"></script>
+	<script type="text/javascript" src="tr-web-control/script/transmission.js?v=20260929"></script>
+	<script type="text/javascript" src="tr-web-control/script/transmission.torrents.js?v=20260929"></script>
+	<script type="text/javascript" src="tr-web-control/script/system.js?v=20260929"></script>
+	<script type="text/javascript" src="tr-web-control/script/torrent-db.js?v=20260929"></script>
+	<script type="text/javascript" src="tr-web-control/script/bind-status.js?v=20260929"></script>
 	<script type="text/javascript" src="tr-web-control/config.js?v=20200914"></script>
 	<script type="text/javascript" src="tr-web-control/plugin.js?v=20200914"></script>
 	<script type="text/javascript">
@@ -151,6 +154,7 @@
 					<label id="toolbar_label_reload_time_unit"></label>
 					<a id="toolbar_autoreload" href="javascript:void(0);" class="easyui-linkbutton" data-options="plain:true"></a>
 					<span id="toolbar_right_area" style="padding:1px;position: absolute;right: 2px;">
+						<!-- [torrent-db] 分类管理入口已移至左栏"分类"组右键菜单 -->
 						<!-- 搜索 -->
 						<input id="toolbar_search" type="text" class="easyui-searchbox" style="width:200px;" />
 					</span>

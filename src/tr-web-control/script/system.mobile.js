@@ -78,7 +78,16 @@ var system = {
 
 		$.each(items, function (key, item) {
 			var name = $(item).attr("system-lang");
-			$(item).html(eval("system.lang." + name));
+			// 按键路径取文案（替代原 eval 实现）
+			var cur = system.lang;
+			var keys = String(name || "").replace(/\[/g, ".").replace(/\]/g, "").replace(/['"]/g, "").split(".");
+			for (var i = 0; i < keys.length; i++) {
+				var k = keys[i];
+				if (!k) continue;
+				if (cur == null || typeof cur !== "object") { cur = ""; break; }
+				cur = cur[k];
+			}
+			$(item).html(cur == null ? "" : cur);
 		});
 	},
 	init: function (lang, islocal) {

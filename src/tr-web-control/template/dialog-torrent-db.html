@@ -1,0 +1,145 @@
+<!-- [torrent-db] 分类管理弹窗：新建/编辑/删除分类（删除只删规则，文件不动）；
+	 绑定设置在 系统设置 → 绑定 页签 -->
+<div style="width:100%;height:100%;display:flex;flex-direction:column;padding:8px;box-sizing:border-box;">
+	<!-- 表单：新建 / 编辑 -->
+	<div id="tdb-form" style="display:flex;gap:6px;align-items:center;padding-bottom:8px;border-bottom:1px dotted #ccc;">
+		<input id="tdb-old-name" type="hidden" value=""/>
+		<input id="tdb-name" type="text" placeholder="" style="width:160px;height:26px;"/>
+		<input id="tdb-path" type="text" placeholder="" style="flex:1;height:26px;"/>
+		<button id="tdb-btn-save" style="height:26px;padding:0 12px;cursor:pointer;"></button>
+		<button id="tdb-btn-cancel-edit" style="height:26px;padding:0 12px;cursor:pointer;display:none;"></button>
+	</div>
+	<!-- 分类列表 -->
+	<div style="flex:1;overflow:auto;margin-top:6px;">
+		<table id="tdb-table" width="100%" cellspacing="0" style="border-collapse:collapse;font-size:12px;">
+			<thead>
+				<tr id="tdb-table-head"></tr>
+			</thead>
+			<tbody id="tdb-table-body"></tbody>
+		</table>
+	</div>
+	<!-- 底部 -->
+	<div style="text-align:right;padding-top:8px;border-top:1px dotted #ccc;">
+		<span id="tdb-hint" style="float:left;color:#888;font-size:11px;line-height:24px;"></span>
+		<button id="tdb-btn-close" style="height:26px;padding:0 16px;cursor:pointer;"></button>
+	</div>
+</div>
+<script type="text/javascript">
+	(function (thisDialog) {
+		function t(key) {
+			return window.TorrentDB ? TorrentDB._t(key) : key;
+		}
+
+		var page = {
+			init: function () {
+				this.setTexts();
+				this.initEvents();
+				this.render();
+			},
+			setTexts: function () {
+				$("#tdb-name", thisDialog).attr("placeholder", t("namePh"));
+				$("#tdb-path", thisDialog).attr("placeholder", t("pathPh"));
+				$("#tdb-btn-save", thisDialog).text(t("save"));
+				$("#tdb-btn-cancel-edit", thisDialog).text(t("cancel"));
+				$("#tdb-btn-close", thisDialog).text(t("close"));
+				$("#tdb-hint", thisDialog).text(t("hint"));
+				$("#tdb-table-head", thisDialog).html(
+					"<th style='text-align:left;padding:4px 6px;border-bottom:1px solid #ccc;'>" + t("colName") + "</th>" +
+					"<th style='text-align:left;padding:4px 6px;border-bottom:1px solid #ccc;'>" + t("colPath") + "</th>" +
+					"<th style='text-align:right;padding:4px 6px;border-bottom:1px solid #ccc;'>" + t("colFiles") + "</th>" +
+					"<th style='text-align:right;padding:4px 6px;border-bottom:1px solid #ccc;'>" + t("colOp") + "</th>"
+				);
+			},
+			initEvents: function () {
+				$("#tdb-btn-save", thisDialog).click(function () {
+					page.save();
+				});
+				$("#tdb-path", thisDialog).keydown(function (e) {
+					if (e.keyCode == 13) page.save();
+				});
+				$("#tdb-btn-cancel-edit", thisDialog).click(function () {
+					page.resetForm();
+				});
+				$("#tdb-btn-close", thisDialog).click(function () {
+					thisDialog.dialog("close");
+				});
+			},
+			resetForm: function () {
+				$("#tdb-old-name", thisDialog).val("");
+				$("#tdb-name", thisDialog).val("");
+				$("#tdb-path", thisDialog).val("");
+				$("#tdb-btn-cancel-edit", thisDialog).hide();
+			},
+			render: function () {
+				var body = $("#tdb-table-body", thisDialog);
+				body.empty();
+				var cats = window.TorrentDB ? TorrentDB.categories : [];
+				for (var i = 0; i < cats.length; i++) {
+					var c = cats[i];
+					(function (c) {
+						var tr = $("<tr/>").appendTo(body);
+						$("<td style='padding:4px 6px;'/>").text(c.name).appendTo(tr);
+						$("<td style='padding:4px 6px;'/>").text(c.path).appendTo(tr);
+						$("<td style='padding:4px 6px;text-align:right;'/>").text(c.files).appendTo(tr);
+						var td = $("<td style='padding:4px 6px;text-align:right;white-space:nowrap;'/>").appendTo(tr);
+						$("<a href='javascript:void(0);' style='margin-right:8px;'/>").text(t("edit")).click(function () {
+							page.startEdit(c);
+						}).appendTo(td);
+						$("<a href='javascript:void(0);' style='color:#c00;'/>").text(t("del")).click(function () {
+							page.remove(c);
+						}).appendTo(td);
+					})(c);
+				}
+			},
+			startEdit: function (c) {
+				$("#tdb-old-name", thisDialog).val(c.name);
+				$("#tdb-name", thisDialog).val(c.name);
+				$("#tdb-path", thisDialog).val(c.path);
+				$("#tdb-btn-cancel-edit", thisDialog).show();
+				$("#tdb-name", thisDialog).focus();
+			},
+			save: function () {
+				var oldName = $("#tdb-old-name", thisDialog).val();
+				var name = $.trim($("#tdb-name", thisDialog).val());
+				var path = $.trim($("#tdb-path", thisDialog).val());
+				if (!name || !path) return;
+				var payload = { name: name, path: path };
+				if (oldName) payload.oldName = oldName;
+				$.ajax({
+					url: TorrentDB.url("/api/category"),
+					method: "POST",
+					contentType: "application/json",
+					data: JSON.stringify(payload),
+					success: function () {
+						page.resetForm();
+						TorrentDB.load(function () { page.render(); });
+					},
+					error: function (xhr) {
+						$.messager.alert("", TorrentDB._err(xhr));
+					}
+				});
+			},
+			remove: function (c) {
+				$.messager.confirm("", t("deleteConfirm", c.name), function (ok) {
+					if (!ok) return;
+					$.ajax({
+						url: TorrentDB.url("/api/category-delete"),
+						method: "POST",
+						contentType: "application/json",
+						data: JSON.stringify({ name: c.name }),
+						success: function () {
+							if (TorrentDB.current == c.name) {
+								TorrentDB.current = "";
+							}
+							TorrentDB.load(function () { page.render(); });
+						},
+						error: function (xhr) {
+							$.messager.alert("", TorrentDB._err(xhr));
+						}
+					});
+				});
+			}
+		};
+		page.init();
+	})($("#dialog-torrent-db"));
+</script>

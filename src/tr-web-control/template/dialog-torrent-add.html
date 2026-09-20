@@ -11,6 +11,12 @@
 					</td>
 				</tr>
 				<tr>
+					<td width="20%" class="title"><span id="tdb-add-category-label"></span></td>
+					<td width="80%">
+						<select id="tdb-add-category" style="width:450px;"></select>
+					</td>
+				</tr>
+				<tr>
 					<td class="title"><label id="dialog-torrent-add-upload-file" for="torrent_upload_file"></label></td>
 					<td>
 						<form action="#" method="post" id="torrent_upload_form" enctype="multipart/form-data" target="torrent_upload_frame">
@@ -21,7 +27,7 @@
 				<tr>
 					<td class="title"><span id="dialog-torrent-add-torrent-url"></span></td>
 					<td>
-						<textarea id="torrent_url" style="height:130px;"></textarea>
+						<textarea id="torrent_url" style="height:100px;"></textarea>
 						<span id="dialog-torrent-add-tip-torrent-url"></span>
 					</td>
 				</tr>
@@ -75,10 +81,12 @@
 		thisDialog.find("#download-dir").val(system.downloadDir);
 
 		var downloadDirs = $.merge([],transmission.downloadDirs);
-		if (system.dictionary.folders != null && system.dictionary.folders != "")
+		if (system.dictionary.folders != null && system.dictionary.folders != "" && system.dictionary.folders != "undefined")
 		{
 			$.merge(downloadDirs,system.dictionary.folders.split("\n"));
 		}
+		// [torrent-db] 过滤无效项（历史配置里可能存有 "undefined" 字符串）
+		downloadDirs = downloadDirs.filter(function(item){ return item && typeof item == "string" && item != "undefined"; });
 		downloadDirs = downloadDirs.map(item => {
 			return item[item.length - 1] == '/' ? item.slice(0, -1) : item;
 		});
@@ -100,6 +108,11 @@
 
 		thisDialog.find("#chkautostart").prop("checked", system.serverConfig["start-added-torrents"]);
 		thisDialog.find("#download-dir").combobox();
+
+		// [torrent-db] 分类选择 + 保存路径补全
+		if (window.TorrentDB) {
+			TorrentDB.wireAddDialog(thisDialog);
+		}
 
 		// label 
 		var labelPage = {

@@ -1,0 +1,607 @@
+#!/usr/bin/with-contenv python3
+# -*- coding: utf-8 -*-
+"""torrent-db: 种子分类数据库服务（transmission-web-control 配套后端）。
+
+在 transmission 容器内以 s6 服务方式常驻（linuxserver 镜像 /custom-services.d）：
+  - SQLite 库保存 分类(name->path) 与 归属(种子名->分类)；
+  - HTTP API 供 web-control 前端查询/管理/划入分类，划入时立即通过
+    transmission RPC torrent-set-location(move=true) 搬移文件；
+  - 轮询线程兜底：按种子名比对归属表，发现目录不符（重加种子、上次搬移失败、
+    分类改路径）自动重新搬移。删除分类只删规则不动文件。
+
+全部 SQL 使用参数绑定；所有配置走环境变量（compose 传入）。
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address, ip_network
+from urllib import request as urlrequest
+from urllib.error import URLError
+
+PORT = int(os.environ.get("TORRENTDB_PORT", "38082"))
+RPC_URL = os.environ.get("TORRENTDB_RPC_URL", "http://127.0.0.1:38081/transmission/rpc")
+DB_PATH = os.environ.get("TORRENTDB_DB", "/config/torrent-db.sqlite3")
+POLL_INTERVAL = int(os.environ.get("TORRENTDB_POLL_INTERVAL", "20"))
+ROOTS = [os.path.normpath(p) for p in os.environ.get("TORRENTDB_ROOTS", "/downloads").split(",") if p.strip()]
+BIND_STATUS = os.environ.get("TORRENTDB_BIND_STATUS", "/config/public_html/bind-status.txt")
+# settings 表允许写入的键（目前只有绑定网卡，由 bind-watch 消费）
+SETTING_KEYS = {"bind_interface"}
+DRY_RUN = os.environ.get("TORRENTDB_DRY_RUN", "0") == "1"
+ALLOW_NETS = [
+    ip_network(n.strip())
+    for n in os.environ.get(
+        "TORRENTDB_ALLOW", "127.0.0.0/8,::1/128,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,fc00::/7"
+    ).split(",")
+    if n.strip()
+]
+# 同一种子两次自动搬移命令之间的最小间隔（秒），防止搬移进行中反复下发
+MOVE_COOLDOWN = int(os.environ.get("TORRENTDB_MOVE_COOLDOWN", "300"))
+
+_db_lock = threading.Lock()
+_move_lock = threading.Lock()
+_last_move = {}  # name -> (monotonic time, target path)
+_session_id = None
+_session_lock = threading.Lock()
+
+
+def log(msg):
+    print("[torrent-db] %s %s" % (time.strftime("%F %T"), msg), flush=True)
+
+
+# ---------------------------------------------------------------- database
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    with _db_lock:
+        conn = db()
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS categories ("
+                " name TEXT PRIMARY KEY,"
+                " path TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS files ("
+                " name TEXT PRIMARY KEY,"
+                " category TEXT NOT NULL REFERENCES categories(name) ON DELETE CASCADE)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS settings ("
+                " key TEXT PRIMARY KEY,"
+                " value TEXT NOT NULL)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    log("database ready at %s" % DB_PATH)
+
+
+def validate_category(name, path):
+    if not name or not isinstance(name, str) or len(name) > 100:
+        return "分类名不能为空且不超过100字符"
+    if "/" in name:
+        return "分类名不能包含 /"
+    if not path or not isinstance(path, str):
+        return "路径不能为空"
+    norm = os.path.normpath(path)
+    if norm.startswith("..") or "/../" in norm:
+        return "路径不合法"
+    for root in ROOTS:
+        if norm == root or norm.startswith(root + os.sep):
+            return None
+    return "路径必须在托管根目录下: %s" % ", ".join(ROOTS)
+
+
+def validate_setting(key, value):
+    if key not in SETTING_KEYS:
+        return "不支持的设置项: %s" % key
+    if not isinstance(value, str):
+        return "设置值必须是字符串"
+    if key == "bind_interface" and value and not re.fullmatch(r"[a-zA-Z0-9._-]{1,15}", value):
+        return "网卡名不合法（空=不绑定，或 1-15 位字母数字）"
+    return None
+
+
+def read_bind_status():
+    """读取 bind-watch 写的实时状态文件，供前端展示。"""
+    try:
+        with open(BIND_STATUS, encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+    info = {}
+    for line in content.splitlines():
+        k, _, v = line.partition("=")
+        info[k.strip()] = v.strip()
+    return info
+
+
+_NOISE_IF = re.compile(r"^(lo$|veth|docker|br-|bonding_masters)")
+
+
+def _addrs_of(dev):
+    """网卡的全局 IPv4/IPv6（无则空串），与 bind-watch 同款解析。"""
+    v4 = v6 = ""
+    out4 = subprocess.run(
+        ["ip", "-4", "addr", "show", "dev", dev, "scope", "global"],
+        capture_output=True, text=True,
+    ).stdout
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out4)
+    if m:
+        v4 = m.group(1)
+    out6 = subprocess.run(
+        ["ip", "-6", "addr", "show", "dev", dev, "scope", "global"],
+        capture_output=True, text=True,
+    ).stdout
+    m = re.search(r"inet6 ([0-9a-fA-F:]+)", out6)
+    if m:
+        v6 = m.group(1)
+    return v4, v6
+
+
+def list_interfaces():
+    """宿主机网卡列表 [{name, ipv4, ipv6}]（容器 host 网络，即宿主接口）。
+
+    过滤 loopback、veth 对、docker 网桥等噪音；bond/wlan/tun/wg 等真实可用接口保留。
+    """
+    try:
+        names = sorted(n for n in os.listdir("/sys/class/net") if not _NOISE_IF.match(n))
+    except OSError:
+        return []
+    return [dict(name=n, **dict(zip(("ipv4", "ipv6"), _addrs_of(n)))) for n in names]
+
+
+# ---------------------------------------------------------------- transmission RPC
+
+def rpc(method, arguments=None, timeout=15):
+    global _session_id
+    body = json.dumps({"method": method, "arguments": arguments or {}}).encode()
+    last_err = None
+    for attempt in range(3):
+        req = urlrequest.Request(RPC_URL, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with _session_lock:
+            if _session_id:
+                req.add_header("X-Transmission-Session-Id", _session_id)
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                with _session_lock:
+                    _session_id = resp.headers.get("X-Transmission-Session-Id", _session_id)
+                return json.loads(resp.read().decode())
+        except urlrequest.HTTPError as e:
+            if e.code == 409:  # 会话 ID 过期，取新 ID 重试
+                with _session_lock:
+                    _session_id = e.headers.get("X-Transmission-Session-Id")
+                last_err = e
+                continue
+            raise
+        except (URLError, OSError) as e:
+            last_err = e
+            time.sleep(1)
+    raise RuntimeError("RPC %s 失败: %s" % (method, last_err))
+
+
+def get_all_torrents():
+    result = rpc("torrent-get", {"fields": ["id", "name", "downloadDir"]})
+    return result.get("arguments", {}).get("torrents", [])
+
+
+def move_torrents(ids, target):
+    if not ids:
+        return
+    if DRY_RUN:
+        log("DRY-RUN torrent-set-location ids=%s -> %s" % (ids, target))
+        return
+    rpc("torrent-set-location", {"ids": ids, "location": target, "move": True})
+
+
+# ---------------------------------------------------------------- poller
+
+def poller_loop():
+    log("poller started (interval=%ss, roots=%s, dry_run=%s)" % (POLL_INTERVAL, ROOTS, DRY_RUN))
+    while True:
+        try:
+            with _db_lock:
+                conn = db()
+                try:
+                    cats = {r["name"]: r["path"] for r in conn.execute("SELECT name, path FROM categories")}
+                    assignments = {r["name"]: r["category"] for r in conn.execute("SELECT name, category FROM files")}
+                finally:
+                    conn.close()
+            if cats:
+                torrents = get_all_torrents()
+                # 自动归类：位于分类目录里但还没有归属记录的种子（添加种子时选了
+                # 分类即写入目录，这里反向补录归属；重加的种子也靠它自动归队）
+                path_to_cat = {p: c for c, p in cats.items()}
+                inserts = []
+                for t in torrents:
+                    if t["name"] in assignments:
+                        continue
+                    cat = path_to_cat.get(t["downloadDir"])
+                    if cat:
+                        inserts.append((t["name"], cat))
+                        assignments[t["name"]] = cat
+                if inserts:
+                    with _db_lock:
+                        conn = db()
+                        try:
+                            conn.executemany(
+                                "INSERT INTO files(name, category) VALUES(?,?) "
+                                "ON CONFLICT(name) DO UPDATE SET category=excluded.category",
+                                inserts,
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
+                    log("auto-assigned %d torrent(s) by path" % len(inserts))
+                to_move = {}
+                for t in torrents:
+                    cat = assignments.get(t["name"])
+                    if not cat:
+                        continue
+                    target = cats.get(cat)
+                    if not target or t["downloadDir"] == target:
+                        continue
+                    with _move_lock:
+                        last = _last_move.get(t["name"])
+                        if last and last[1] == target and time.monotonic() - last[0] < MOVE_COOLDOWN:
+                            continue
+                        _last_move[t["name"]] = (time.monotonic(), target)
+                    to_move.setdefault(target, []).append(t["id"])
+                for target, ids in to_move.items():
+                    log("poller: move %s torrent(s) -> %s" % (len(ids), target))
+                    move_torrents(ids, target)
+        except Exception as e:  # 轮询永不退出
+            log("poller error: %s" % e)
+        time.sleep(POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------- http api
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "torrent-db/1.0"
+
+    def log_message(self, fmt, *args):
+        log("%s %s" % (self.address_string(), fmt % args))
+
+    # -- helpers
+
+    def client_ip(self):
+        return ip_address(self.client_address[0].split("%")[0])
+
+    def check_access(self):
+        ip = self.client_ip()
+        for net in ALLOW_NETS:
+            if ip in net:
+                return True
+        return False
+
+    def send_json(self, code, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _cors(self):
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def read_json(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 1 << 20:
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode())
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    # -- verbs
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def route(self):
+        """去掉查询串后的纯路径。"""
+        return self.path.split("?", 1)[0]
+
+    def do_GET(self):
+        if not self.check_access():
+            self.send_json(403, {"error": "forbidden"})
+            return
+        path = self.route()
+        if path == "/api/health":
+            self.send_json(200, {"ok": True, "roots": ROOTS, "dry_run": DRY_RUN})
+        elif path == "/api/interfaces":
+            self.send_json(200, {"interfaces": list_interfaces()})
+        elif path == "/api/ls":
+            self.api_ls()
+        elif path == "/api/data":
+            with _db_lock:
+                conn = db()
+                try:
+                    categories = [
+                        {
+                            "name": r["name"],
+                            "path": r["path"],
+                            "files": conn.execute(
+                                "SELECT COUNT(*) FROM files WHERE category = ?", (r["name"],)
+                            ).fetchone()[0],
+                        }
+                        for r in conn.execute("SELECT name, path FROM categories ORDER BY name")
+                    ]
+                    assignments = {
+                        r["name"]: r["category"]
+                        for r in conn.execute("SELECT name, category FROM files")
+                    }
+                    settings = {
+                        r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")
+                    }
+                finally:
+                    conn.close()
+            self.send_json(
+                200,
+                {
+                    "categories": categories,
+                    "assignments": assignments,
+                    "settings": settings,
+                    "bind": read_bind_status(),
+                },
+            )
+        else:
+            self.send_json(404, {"error": "not found"})
+
+    def api_ls(self):
+        """列出托管根目录内的下一级子目录（供添加种子时的路径补全）。
+
+        仅允许访问 TORRENTDB_ROOTS 之下的路径，防止目录穿越。
+        """
+        query = ""
+        if "?" in self.path:
+            query = self.path.split("?", 1)[1]
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        raw = params.get("path", "")
+        try:
+            from urllib.parse import unquote
+            raw = unquote(raw)
+        except Exception:
+            raw = raw
+        p = os.path.normpath(raw)
+        if not p or p in (".", "/"):
+            self.send_json(400, {"error": "bad path"})
+            return
+        allowed = False
+        for root in ROOTS:
+            if p == root or p.startswith(root + os.sep):
+                allowed = True
+                break
+        if not allowed:
+            self.send_json(403, {"error": "path outside managed roots"})
+            return
+        if not os.path.isdir(p):
+            self.send_json(404, {"error": "not a directory"})
+            return
+        try:
+            dirs = sorted(
+                d for d in os.listdir(p)
+                if not d.startswith(".") and os.path.isdir(os.path.join(p, d))
+            )
+        except OSError as e:
+            self.send_json(500, {"error": str(e)})
+            return
+        self.send_json(200, {"path": p, "dirs": dirs})
+
+    def do_POST(self):
+        if not self.check_access():
+            self.send_json(403, {"error": "forbidden"})
+            return
+        body = self.read_json()
+        if body is None:
+            self.send_json(400, {"error": "bad json"})
+            return
+        try:
+            path = self.route()
+            if path == "/api/category":
+                self.api_category_upsert(body)
+            elif path == "/api/category-delete":
+                self.api_category_delete(body)
+            elif path == "/api/category-remove-unused":
+                self.api_category_remove_unused()
+            elif path == "/api/assign":
+                self.api_assign(body)
+            elif path == "/api/settings":
+                self.api_settings_set(body)
+            else:
+                self.send_json(404, {"error": "not found"})
+        except RuntimeError as e:
+            self.send_json(502, {"error": str(e)})
+        except Exception as e:
+            log("api error: %s" % e)
+            self.send_json(500, {"error": str(e)})
+
+    def do_DELETE(self):
+        if not self.check_access():
+            self.send_json(403, {"error": "forbidden"})
+            return
+        body = self.read_json() or {}
+        try:
+            if self.route() == "/api/category":
+                self.api_category_delete(body)
+            else:
+                self.send_json(404, {"error": "not found"})
+        except Exception as e:
+            log("api error: %s" % e)
+            self.send_json(500, {"error": str(e)})
+
+    # -- endpoints
+
+    def api_category_upsert(self, body):
+        name = (body.get("name") or "").strip()
+        path = (body.get("path") or "").strip()
+        old_name = (body.get("oldName") or "").strip()  # 改名时传原名字
+        err = validate_category(name, path)
+        if err:
+            self.send_json(400, {"error": err})
+            return
+        with _db_lock:
+            conn = db()
+            try:
+                if old_name and old_name != name:
+                    # 改名：更新分类并保留归属
+                    conn.execute("UPDATE categories SET name=?, path=? WHERE name=?", (name, path, old_name))
+                    if conn.rowcount == 0:
+                        conn.execute("INSERT INTO categories(name, path) VALUES(?,?)", (name, path))
+                else:
+                    conn.execute(
+                        "INSERT INTO categories(name, path) VALUES(?,?) "
+                        "ON CONFLICT(name) DO UPDATE SET path=excluded.path",
+                        (name, path),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        log("category upserted: %s -> %s" % (name, path))
+        self.send_json(200, {"ok": True})
+
+    def api_category_delete(self, body):
+        name = (body.get("name") or "").strip()
+        if not name:
+            self.send_json(400, {"error": "缺少分类名"})
+            return
+        with _db_lock:
+            conn = db()
+            try:
+                # ON DELETE CASCADE 只删归属记录，文件不动
+                cur = conn.execute("DELETE FROM categories WHERE name=?", (name,))
+                conn.commit()
+                deleted = cur.rowcount
+            finally:
+                conn.close()
+        if not deleted:
+            self.send_json(404, {"error": "分类不存在"})
+            return
+        log("category deleted (files untouched): %s" % name)
+        self.send_json(200, {"ok": True})
+
+    def api_category_remove_unused(self):
+        """删除没有任何种子归属的分类（文件不动）。"""
+        with _db_lock:
+            conn = db()
+            try:
+                cur = conn.execute(
+                    "DELETE FROM categories "
+                    "WHERE name NOT IN (SELECT DISTINCT category FROM files)"
+                )
+                conn.commit()
+                removed = cur.rowcount
+            finally:
+                conn.close()
+        log("removed %d unused category(ies)" % removed)
+        self.send_json(200, {"ok": True, "removed": removed})
+
+    def api_settings_set(self, body):
+        key = (body.get("key") or "").strip()
+        value = body.get("value")
+        err = validate_setting(key, "" if value is None else str(value))
+        if err:
+            self.send_json(400, {"error": err})
+            return
+        with _db_lock:
+            conn = db()
+            try:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        log("setting updated: %s = %r" % (key, value))
+        self.send_json(200, {"ok": True})
+
+    def api_assign(self, body):
+        names = body.get("names") or []
+        category = body.get("category")
+        if not names or not isinstance(names, list):
+            self.send_json(400, {"error": "缺少 names"})
+            return
+        names = [str(n) for n in names]
+        with _db_lock:
+            conn = db()
+            try:
+                if category is None:
+                    for n in names:
+                        conn.execute("DELETE FROM files WHERE name=?", (n,))
+                else:
+                    cat = str(category)
+                    row = conn.execute("SELECT path FROM categories WHERE name=?", (cat,)).fetchone()
+                    if not row:
+                        self.send_json(404, {"error": "分类不存在: %s" % cat})
+                        return
+                    target = row["path"]
+                    for n in names:
+                        conn.execute(
+                            "INSERT INTO files(name, category) VALUES(?,?) "
+                            "ON CONFLICT(name) DO UPDATE SET category=excluded.category",
+                            (n, cat),
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+
+        moved = 0
+        if category is None:
+            log("unassign: %s torrent(s), files untouched" % len(names))
+            self.send_json(200, {"ok": True, "moved": 0})
+            return
+
+        # 立即搬移：按名字找到种子，目录已一致的不重复下发
+        torrents = get_all_torrents()
+        ids = []
+        for t in torrents:
+            if t["name"] not in names:
+                continue
+            with _move_lock:
+                _last_move[t["name"]] = (time.monotonic(), target)
+            if t["downloadDir"] != target:
+                ids.append(t["id"])
+        if ids:
+            log("assign: move %s torrent(s) -> %s" % (len(ids), target))
+            move_torrents(ids, target)
+            moved = len(ids)
+        self.send_json(200, {"ok": True, "moved": moved})
+
+
+def main():
+    init_db()
+    threading.Thread(target=poller_loop, daemon=True).start()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    log("listening on 0.0.0.0:%s (rpc=%s, db=%s)" % (PORT, RPC_URL, DB_PATH))
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

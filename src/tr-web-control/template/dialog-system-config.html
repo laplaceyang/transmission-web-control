@@ -457,6 +457,36 @@
                        system-lang="dialog['public']['button-export']"></a>
                 </div>
             </div>
+            <!-- [torrent-db] 绑定设置页签（网卡列表/状态由 torrent-db 后端提供） -->
+            <div title="绑定" style="padding:8px;padding-right:12px;" class="dialog">
+                <table style="width:100%;font-size:12px;">
+                    <tr>
+                        <td colspan="2" style="padding-bottom:10px;">
+                            <span id="tdb-bind-now-label"></span><span id="tdb-bind-now" style="color:#888;"></span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="width:24px;"><input type="radio" name="tdb-bind-mode" value="none" config-type="1"/></td>
+                        <td><span id="tdb-bind-none-text"></span></td>
+                    </tr>
+                    <tr>
+                        <td style="padding-top:6px;"><input type="radio" name="tdb-bind-mode" value="if" config-type="1"/></td>
+                        <td style="padding-top:6px;">
+                            <span id="tdb-bind-if-text"></span>
+                            <select id="tdb-bind-if-select" style="width:160px;height:24px;"></select>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td></td>
+                        <td><div id="tdb-bind-addr" style="padding-top:4px;color:#555;font-size:11px;"></div></td>
+                    </tr>
+                    <tr>
+                        <td colspan="2">
+                            <div id="tdb-bind-tip" style="color:#888;font-size:11px;padding-top:10px;line-height:1.6;"></div>
+                        </td>
+                    </tr>
+                </table>
+            </div>
         </div>
     </div>
     <div data-options="region:'south',border:false" style="text-align:right;padding:6px;">
@@ -491,6 +521,10 @@
         this.initConfigValue();
         this.initEvents();
         this.initUserLabels();
+        // [torrent-db] 初始化绑定页签
+        if (window.TorrentDB) {
+          TorrentDB.initBindTab(thisDialog);
+        }
       },
       // 初始化选项卡
       initTabs: function () {
@@ -753,6 +787,10 @@
 
         // 保存参数
         thisDialog.find('#system-config-button-save').click(function () {
+          // [torrent-db] 绑定设置一并保存（有变化才提交到 torrent-db 后端）
+          if (window.TorrentDB) {
+            TorrentDB.saveBindTab(thisDialog);
+          }
           var inputs = thisDialog.find('input');
           var config = {};
           var days = new Array();
