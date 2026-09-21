@@ -17,8 +17,7 @@
 	var NODE_ALL = "torrentdb-cat-all";
 	var NODE_NONE = "torrentdb-cat-none";
 	var UNCATEGORIZED = "@";
-	// 60 秒同步一次后端数据
-	var SYNC_INTERVAL = 60 * 1000;
+	// 数据同步节拍跟随页面自动刷新（system.js reloadData 里触发 load()）
 
 	// 内置文案（个人 fork，不进 16 个 i18n 文件；en 缺失时回退中文）
 	var TEXT = {
@@ -60,7 +59,8 @@
 			bindTabTitle: "绑定",
 			bindAddrNone: "该网卡当前没有全局地址",
 			addCategoryLabel: "分类",
-			addCategoryNone: "不指定（默认目录）"
+			addCategoryNone: "不指定（默认目录）",
+			columnTitle: "分类"
 		},
 		en: {
 			all: "All categories",
@@ -100,7 +100,8 @@
 			bindTabTitle: "Binding",
 			bindAddrNone: "No global address on this interface",
 			addCategoryLabel: "Category",
-			addCategoryNone: "None (default directory)"
+			addCategoryNone: "None (default directory)",
+			columnTitle: "Category"
 		}
 	};
 
@@ -196,6 +197,24 @@
 			};
 		},
 
+		// 计算各分类在线种子数/未分类数（左栏树节点计数用）
+		computeCounts: function () {
+			var counts = {};
+			var unc = 0;
+			var all = transmission.torrents.all || {};
+			for (var key in all) {
+				var tt = all[key];
+				if (!tt || !tt.name) continue;
+				var cat = this.assignments[tt.name];
+				if (cat) {
+					counts[cat] = (counts[cat] || 0) + 1;
+				} else {
+					unc++;
+				}
+			}
+			return { counts: counts, unc: unc };
+		},
+
 		// 按数据重建分类子节点（增/改文本/删失效节点），文本带在库种子计数。
 		// 注意：easyui 的 tree 方法必须以 system.panel.left.tree(...) 形式调用
 		// （不能把方法抽出来单独调用，会丢失 this 导致内部拿不到树元素）。
@@ -222,19 +241,9 @@
 				};
 
 				// 计算每个分类的在线种子数 / 未分类数
-				var counts = {};
-				var unc = 0;
-				var all = transmission.torrents.all || {};
-				for (var key in all) {
-					var tt = all[key];
-					if (!tt || !tt.name) continue;
-					var cat = this.assignments[tt.name];
-					if (cat) {
-						counts[cat] = (counts[cat] || 0) + 1;
-					} else {
-						unc++;
-					}
-				}
+				var cnt = this.computeCounts();
+				var counts = cnt.counts;
+				var unc = cnt.unc;
 
 				var byId = scan();
 				// 移除已删除分类的节点
@@ -287,6 +296,18 @@
 			} catch (e) { /* 导航树未就绪时跳过，下一轮同步再试 */
 				if (window.console && console.warn) console.warn("[torrent-db] updateCategoryTree:", e);
 			}
+		},
+
+		// ---- 列表"分类"列 -------------------------------------------------
+		// 列定义在 template/torrent-fields.json（tdb_category），system.js
+		// 初始化时把标题/渲染接到这里；数据是归属表，随 reloadData 节拍刷新
+		categoryColumnTitle: function () {
+			return t("columnTitle");
+		},
+
+		categoryFormatter: function (value, row) {
+			var cat = TorrentDB.assignments[row.name];
+			return cat ? $("<span/>").text(cat).html() : "";
 		},
 
 		// 分类维度节点（全部分类/未分类/各分类）是独立于状态节点的筛选开关：
@@ -407,8 +428,16 @@
 			// 界面尚未初始化（如 transmission 里还没有种子）时跳过
 			if (!system.control || !system.control.torrentlist) return;
 			var node = system.panel.left.tree("getSelected");
+			if (node == null) {
+				// 没有选中节点时兜底到"全部"，保证归属更新后列表一定重绘
+				node = system.panel.left.tree("find", "torrent-all");
+			}
 			if (node != null) {
-				system.loadTorrentToList({ node: node });
+				try {
+					system.loadTorrentToList({ node: node });
+				} catch (e) {
+					if (window.console && console.warn) console.warn("[torrent-db] refreshList:", e);
+				}
 			}
 		},
 
@@ -582,6 +611,26 @@
 		},
 
 		// ---- 划入/移出 --------------------------------------------------
+		// 添加种子后立即写入归属（添加响应里带种子名），不等轮询器按路径补录；
+		// 写完刷新分类数据，树计数/列表列马上更新
+		assignTorrent: function (name, category) {
+			if (!name || !category) return;
+			$.ajax({
+				url: this.url("/api/assign"),
+				method: "POST",
+				contentType: "application/json",
+				data: JSON.stringify({ names: [name], category: category }),
+				success: function () {
+					TorrentDB.load();
+				},
+				error: function (xhr) {
+					if (window.console && console.warn) {
+						console.warn("[torrent-db] assign failed:", errText(xhr));
+					}
+				}
+			});
+		},
+
 		assign: function (category) {
 			var rows = system.control.torrentlist.datagrid("getChecked");
 			if (rows.length == 0) {
@@ -670,11 +719,17 @@
 	// 对外暴露 & 启动
 	window.TorrentDB = TorrentDB;
 
+	// 立即预取归属数据：列表首次渲染要等语言/RPC 就绪（约 1-3 秒），这里
+	// 抢在渲染前把 /api/data 拿到手，分类列/树计数首次渲染即有值，消除
+	// "刷新后时有时无"的竞态；UI 未就绪时 updateCategoryTree/refreshList 自行跳过
+	TorrentDB.load();
+
 	$(function () {
 		// 恢复上次的分类筛选
 		TorrentDB.current = localStorage.getItem("torrentdb_current") || "";
 		// 等 system 初始化到种子列表控件创建完成（initTorrentTable 之后）再拉数据。
 		// 不用 uiIsInitialized：transmission 里没有种子时它永远不会置位。
+		// 之后的周期同步由 system.js 的 reloadData 驱动（与页面自动刷新同节拍）
 		var timer = setInterval(function () {
 			if (window.system && system.control && system.control.torrentlist) {
 				clearInterval(timer);
@@ -687,7 +742,6 @@
 					}
 					TorrentDB.load();
 				}, 5000);
-				setInterval(function () { TorrentDB.load(); }, SYNC_INTERVAL);
 			}
 		}, 500);
 	});

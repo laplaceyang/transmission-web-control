@@ -41,8 +41,9 @@ CREATE TABLE IF NOT EXISTS settings (
 
 ### 字段与行为说明
 
-- **按种子名归属**：`files.name` 是 transmission 里的种子 Name。种子删除后记录**保留**，
-  因此重加同名种子时轮询器会按名字自动归队到原分类目录。
+- **按种子名归属**：`files.name` 是 transmission 里的种子 Name。**种子从 transmission
+  删除后，其归属记录会在下一轮轮询（≤20s）自动删除**，记录数始终等于实际任务数；
+  重加种子时选中分类（或放到分类目录）会按路径重新入库。
 - **按路径自动归类**：轮询器发现"不在 files 表里的种子，其 downloadDir 恰好等于
   某分类的 path"时，自动补一条归属记录（添加种子时选分类、外部工具添加的种子都覆盖）。
 - **删除分类**（`ON DELETE CASCADE`）：级联删除 `files` 里的归属记录，**文件不动、
@@ -90,7 +91,7 @@ settings.json 一起纳入备份即可；删除库文件后服务会自动重建
 }
 ```
 
-- `files` 为该分类的归属记录数（含 transmission 中已不存在的种子，重加可自动归队）
+- `files` 为该分类的归属记录数（= 该分类下当前在库的种子数）
 - `bind` 为 bind-watch 写入的实时状态文件内容；未绑定或文件不存在时为 `null`
 
 ### GET /api/interfaces

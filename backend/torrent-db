@@ -212,6 +212,7 @@ def move_torrents(ids, target):
 
 def poller_loop():
     log("poller started (interval=%ss, roots=%s, dry_run=%s)" % (POLL_INTERVAL, ROOTS, DRY_RUN))
+    poll_started = time.monotonic()
     while True:
         try:
             with _db_lock:
@@ -223,14 +224,33 @@ def poller_loop():
                     conn.close()
             if cats:
                 torrents = get_all_torrents()
+                # 清理已删除种子的归属记录：transmission 里不存在即删，使记录数
+                # 与实际任务一致。daemon 启动初期任务列表可能尚未加载完整，
+                # 服务启动后 120s 内且列表为空时跳过清理，防止误删
+                if torrents or time.monotonic() - poll_started > 120:
+                    live_names = {t["name"] for t in torrents}
+                    stale = [n for n in assignments if n not in live_names]
+                    if stale:
+                        with _db_lock:
+                            conn = db()
+                            try:
+                                conn.executemany("DELETE FROM files WHERE name=?", [(n,) for n in stale])
+                                conn.commit()
+                            finally:
+                                conn.close()
+                        for n in stale:
+                            assignments.pop(n, None)
+                        log("pruned %d assignment(s) of removed torrent(s)" % len(stale))
                 # 自动归类：位于分类目录里但还没有归属记录的种子（添加种子时选了
-                # 分类即写入目录，这里反向补录归属；重加的种子也靠它自动归队）
-                path_to_cat = {p: c for c, p in cats.items()}
+                # 分类即写入目录，这里反向补录归属；同目录重加的种子也靠它归队）
+                # 归一化尾部斜杠：保存目录补全/手输可能带 /，transmission 的
+                # downloadDir 也可能带，精确比对前先剥掉
+                path_to_cat = {(p.rstrip("/") or "/"): c for c, p in cats.items()}
                 inserts = []
                 for t in torrents:
                     if t["name"] in assignments:
                         continue
-                    cat = path_to_cat.get(t["downloadDir"])
+                    cat = path_to_cat.get((t["downloadDir"] or "").rstrip("/"))
                     if cat:
                         inserts.append((t["name"], cat))
                         assignments[t["name"]] = cat
@@ -253,7 +273,7 @@ def poller_loop():
                     if not cat:
                         continue
                     target = cats.get(cat)
-                    if not target or t["downloadDir"] == target:
+                    if not target or (t["downloadDir"] or "").rstrip("/") == target.rstrip("/"):
                         continue
                     with _move_lock:
                         last = _last_move.get(t["name"])
@@ -459,7 +479,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_category_upsert(self, body):
         name = (body.get("name") or "").strip()
-        path = (body.get("path") or "").strip()
+        path = os.path.normpath((body.get("path") or "").strip())
         old_name = (body.get("oldName") or "").strip()  # 改名时传原名字
         err = validate_category(name, path)
         if err:
@@ -470,8 +490,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if old_name and old_name != name:
                     # 改名：更新分类并保留归属
-                    conn.execute("UPDATE categories SET name=?, path=? WHERE name=?", (name, path, old_name))
-                    if conn.rowcount == 0:
+                    cur = conn.execute("UPDATE categories SET name=?, path=? WHERE name=?", (name, path, old_name))
+                    if cur.rowcount == 0:
                         conn.execute("INSERT INTO categories(name, path) VALUES(?,?)", (name, path))
                 else:
                     conn.execute(
@@ -586,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             with _move_lock:
                 _last_move[t["name"]] = (time.monotonic(), target)
-            if t["downloadDir"] != target:
+            if t["downloadDir"].rstrip("/") != target.rstrip("/"):
                 ids.append(t["id"])
         if ids:
             log("assign: move %s torrent(s) -> %s" % (len(ids), target))

@@ -175,6 +175,9 @@
 		thisDialog.find("#torrent-button-ok").click(function()
 		{
 			var dir = thisDialog.find("#download-dir").combobox("getValue");
+			// [torrent-db] 下拉 value 是路径（用于保存目录）；归属接口收分类名
+			var cat = thisDialog.find("#tdb-add-category").combobox("getValue")
+				? thisDialog.find("#tdb-add-category").combobox("getText") : "";
 			var olddir = system.downloadDir;
 			var isnewdir = system.serverConfig["download-dir"]!=dir;
 			var isupload = thisDialog.find("#torrent_upload_file")[0].value!="";
@@ -231,6 +234,12 @@
 							system.saveLabelsConfig(data.hashString, labelPage.getLabels());
 							system.saveConfig();
 						}
+						// [torrent-db] 选了分类时立即写入归属（不等轮询器）
+						if (window.TorrentDB && cat) {
+							var added = data;
+							if (added && added.status == "duplicate" && added.torrent) added = added.torrent;
+							if (added && added.name) TorrentDB.assignTorrent(added.name, cat);
+						}
 						system.reloadData();
 					});
 					return;
@@ -258,7 +267,7 @@
 			else if (url!="")
 			{
 				var urls = url.split("\n");
-				system.addTorrentsToServer(urls,urls.length,autostart,dir,labelPage.getLabels());
+				system.addTorrentsToServer(urls,urls.length,autostart,dir,labelPage.getLabels(),cat);
 				urls = null;
 				thisDialog.dialog("close");
 			}

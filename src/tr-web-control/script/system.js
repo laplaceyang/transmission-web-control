@@ -763,6 +763,32 @@ var system = {
 				fields = $.extend(fields, system.userConfig.torrentList.fields);
 			}
 
+			// [torrent-db] 上面的合并是按索引覆盖的：默认列数组新增列会被旧配置
+			// 顶掉、数组变长时末列会重复。这里按 field 去重，并保证分类列存在
+			//（定稿位置：紧挨"用户标签"之前）
+			(function () {
+				var seen = {};
+				var deduped = [];
+				for (var i = 0; i < fields.length; i++) {
+					var f = fields[i];
+					if (f && f.field && seen[f.field]) continue;
+					if (f && f.field) seen[f.field] = true;
+					deduped.push(f);
+				}
+				fields = deduped;
+				var hasCat = false;
+				for (var j = 0; j < fields.length; j++) {
+					if (fields[j] && fields[j].field == "tdb_category") hasCat = true;
+				}
+				if (!hasCat) {
+					var at = fields.length;
+					for (var m = 0; m < fields.length; m++) {
+						if (fields[m] && fields[m].field == "labels") { at = m; break; }
+					}
+					fields.splice(at, 0, { field: "tdb_category", width: "90", align: "left" });
+				}
+			})();
+
 			// User field settings
 			system.userConfig.torrentList.fields = fields;
 
@@ -782,7 +808,15 @@ var system = {
 				}
 				
 				item.title = system.lang.torrent.fields[item.field] || item.field;
-				system.setFieldFormat(item);
+				// [torrent-db] 分类列：标题跟随语言、渲染读归属表（自定义列不进 i18n 文件）
+				if (item.field == "tdb_category" && window.TorrentDB) {
+					item.title = TorrentDB.categoryColumnTitle();
+					item.formatter = function (value, row) {
+						return TorrentDB.categoryFormatter(value, row);
+					};
+				} else {
+					system.setFieldFormat(item);
+				}
 			}
 
 			// 初始化种子列表
@@ -1839,6 +1873,11 @@ var system = {
 
 		system.reloading = false;
 
+		// [torrent-db] 分类数据与底栏绑定信息跟随页面自动刷新同一节拍
+		//（启用时按 reloadStep 周期执行，停用时仅在手动刷新等时机执行）
+		if (window.TorrentDB) TorrentDB.load();
+		if (window.BindStatus) BindStatus.refresh();
+
 		if (system.config.autoReload) {
 			system.autoReloadTimer = setTimeout(function () {
 				system.reloadData();
@@ -2552,7 +2591,7 @@ var system = {
 		return '<div class="torrent-progress" title="' + progress + '"><div class="torrent-progress-text">' + progress + '</div><div class="torrent-progress-bar ' + className + '" style="width:' + progress + ';"></div></div>';
 	},
 	// Add torrent
-	addTorrentsToServer: function (urls, count, autostart, savepath, labels) {
+	addTorrentsToServer: function (urls, count, autostart, savepath, labels, category) {
 		//this.config.autoReload = false;
 		var index = count - urls.length;
 		var url = urls.shift();
@@ -2566,9 +2605,15 @@ var system = {
 		}
 		this.showStatus(this.lang.system.status.queue + (index + 1) + "/" + (count) + "<br/>" + url, 0);
 		transmission.addTorrentFromUrl(url, savepath, autostart, function (data) {
-			system.addTorrentsToServer(urls, count, autostart, savepath, labels);
+			system.addTorrentsToServer(urls, count, autostart, savepath, labels, category);
 			if(labels != null && data.hashString != null)
 				system.saveLabelsConfig(data.hashString, labels);
+			// [torrent-db] 添加弹窗选了分类时立即写入归属（磁力在拿到名称前仍靠轮询器）
+			if (window.TorrentDB && category) {
+				var added = data;
+				if (added && added.status == "duplicate" && added.torrent) added = added.torrent;
+				if (added && added.name) TorrentDB.assignTorrent(added.name, category);
+			}
 		});
 	},
 	// Starts / pauses the selected torrent

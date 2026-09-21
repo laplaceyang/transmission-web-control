@@ -56,5 +56,16 @@
 	} else {
 		refresh();
 	}
-	setInterval(refresh, 60000);
+	// 周期刷新由 system.js 的 reloadData 驱动（与页面自动刷新同节拍），
+	// 这里只负责首次渲染；语言字典就绪后立即重绘一次（最多观察 20s）
+	var waited = 0;
+	var langTimer = setInterval(function () {
+		if ((window.system && system.lang && system.lang.name) || ++waited >= 20) {
+			clearInterval(langTimer);
+			refresh();
+		}
+	}, 1000);
+
+	// 供 system.js reloadData 调用
+	window.BindStatus = { refresh: refresh };
 })();

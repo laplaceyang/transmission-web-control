@@ -20,6 +20,7 @@
 		,{"field":"trackers","width":"100","align":"left","sortable":true}
 		,{"field":"downloadDir","width":200,"align":"left","sortable":true}
 		,{"field":"activityDate","width":130,"align":"center","sortable":true,"formatter":"longtime"}
+		,{"field":"tdb_category","width":"90","align":"left"}
 		,{"field":"labels","width":130,"align":"left", "formatter": "labels"}
 		,{"field":"doneDate","width":130,"align":"center","sortable":"true","formatter":"longtime"}
 	]
